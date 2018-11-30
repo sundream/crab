@@ -19,7 +19,10 @@ typedef struct _Table {
     TableNode* lastfree;
 } Table;
 
-Table *g_dict = NULL;
+typedef struct _Crab {
+    uint32_t replace_rune;
+    Table *trie;
+} Crab;
 
 inline static void
 initnode(TableNode *node) {
@@ -237,7 +240,6 @@ _dict_insert(lua_State *L, Table* dict) {
 static int
 dict_open(lua_State *L) {
     luaL_checktype(L, 1, LUA_TTABLE);
-
     Table *dict = table_new();
     size_t len = lua_rawlen(L,1);
     size_t i;
@@ -249,30 +251,27 @@ dict_open(lua_State *L) {
         }
         lua_pop(L, 1);
     }
-
-    //_dict_dump(dict, 0);
-    // don't close old g_dict, avoid crash
-    g_dict = dict;
-    return 0;
+    Crab *crab = (Crab*)lua_newuserdata(L,sizeof(*crab));
+    crab->trie = dict;
+    crab->replace_rune = '*';
+    luaL_getmetatable(L,"crab_meta");
+    lua_setmetatable(L,-2);
+    //_dict_dump(dict,0);
+    return 1;
 }
 
+#define check_crab(L,idx)\
+    (Crab*)luaL_checkudata(L,idx,"crab_meta")
+
 static int
-dict_filter(lua_State *L) {
-    if(!g_dict) {
-        return luaL_error(L, "need open first");
-    }
-
-    Table* dict = g_dict;
-    luaL_checktype(L, 1, LUA_TTABLE);
-
-    size_t len = lua_rawlen(L,1);
+next(lua_State *L,Table *dict,int text_idx,size_t start,size_t end,size_t *pos1,size_t *pos2) {
     size_t i,j;
     int flag = 0;
-    for(i=1;i<=len;) {
+    for(i=start;i<=end;) {
         TableNode *node = NULL;
         int step = 0;
-        for(j=i;j<=len;j++) {
-            lua_rawgeti(L, 1, j);
+        for(j=i;j<=end;j++) {
+            lua_rawgeti(L, text_idx, j);
             uint32_t rune = (uint32_t) lua_tointeger(L, -1);
             lua_pop(L, 1);
 
@@ -286,18 +285,104 @@ dict_filter(lua_State *L) {
             if(!(node && node->value)) break;
         }
         if(step > 0) {
-            for(j=0;j<step;j++) {
-                lua_pushinteger(L, '*');
-                lua_rawseti(L, 1, i+j);
-            }
             flag = 1;
-            i = i + step;
+            *pos1 = i;
+            *pos2 = i + step - 1;
+            break;
         } else {
             i++;
         }
     }
+    return flag;
+}
+
+static int
+dict_next(lua_State *L) {
+    Crab *crab = check_crab(L,1);
+    Table* dict = crab->trie;
+    int text_idx = 2;
+    luaL_checktype(L, text_idx, LUA_TTABLE);
+    size_t len = lua_rawlen(L,text_idx);
+    int nargs = lua_gettop(L);
+    size_t start = 1;
+    size_t end = len;
+    if (nargs >= 3) {
+        start = luaL_checkinteger(L,3);
+    }
+    if (nargs >= 4) {
+        end = luaL_checkinteger(L,4);
+    }
+    if (start > end) {
+        return luaL_error(L, "index illegal: %d > %d", start,end);
+    }
+    size_t pos1,pos2;
+    int found = next(L,dict,text_idx,start,end,&pos1,&pos2);
+    lua_pushboolean(L,found);
+    if (!found) {
+        return 1;
+    } else {
+        lua_pushinteger(L,pos1);
+        lua_pushinteger(L,pos2);
+        return 3;
+    }
+}
+
+static int
+dict_filter(lua_State *L) {
+    Crab *crab = check_crab(L,1);
+    Table* dict = crab->trie;
+    uint32_t replace_rune = crab->replace_rune;
+    int text_idx = 2;
+    luaL_checktype(L, text_idx, LUA_TTABLE);
+    size_t len = lua_rawlen(L,text_idx);
+    int nargs = lua_gettop(L);
+    size_t start = 1;
+    size_t end = len;
+    if (nargs >= 3) {
+        start = luaL_checkinteger(L,3);
+    }
+    if (nargs >= 4) {
+        end = luaL_checkinteger(L,4);
+    }
+    if (start > end) {
+        return luaL_error(L, "index illegal: %d > %d", start,end);
+    }
+    size_t i;
+    size_t pos1,pos2;
+    int found;
+    int flag = 0;
+    found = next(L,dict,text_idx,start,end,&pos1,&pos2);
+    while (found) {
+        flag = 1;
+        for(i=pos1;i<=pos2;i++) {
+            lua_pushinteger(L, replace_rune);
+            lua_rawseti(L, text_idx, i);
+        }
+        start = pos2 + 1;
+        found = next(L,dict,text_idx,start,end,&pos1,&pos2);
+    }
     lua_pushboolean(L, flag);
     return 1;
+}
+
+static int
+dict_replace_rune(lua_State *L) {
+    Crab *crab = check_crab(L,1);
+    if (lua_gettop(L) >= 2) {
+        uint32_t rune = luaL_checkinteger(L,2);
+        lua_pushinteger(L,crab->replace_rune);
+        crab->replace_rune = rune;
+        return 1;
+    } else {
+        lua_pushinteger(L,crab->replace_rune);
+        return 1;
+    }
+}
+
+static int crab_gc(lua_State *L) {
+    Crab *crab = check_crab(L,1);
+    _dict_close(crab->trie);
+    return 0;
 }
 
 // interface
@@ -305,13 +390,24 @@ int
 luaopen_crab_c(lua_State *L) {
     luaL_checkversion(L);
 
+    luaL_Reg crab_methods[] = {
+        {"filter", dict_filter},
+        {"next", dict_next},
+        {"replace_rune",dict_replace_rune},
+        {NULL, NULL}
+    };
+    luaL_newmetatable(L,"crab_meta");
+    lua_newtable(L);
+    luaL_setfuncs(L,crab_methods,0);
+    lua_setfield(L,-2,"__index");
+    lua_pushcfunction(L,crab_gc);
+    lua_setfield(L,-2,"__gc");
+
     luaL_Reg l[] = {
         {"open", dict_open},
-        {"filter", dict_filter},
-        {NULL, NULL}
+        {"new",dict_open},
     };
 
     luaL_newlib(L, l);
     return 1;
 }
-

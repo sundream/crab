@@ -12,4 +12,4 @@ test: all
 test1: 
 	#./crab words.txt "热爱中国共产党, 响应中央号召"
 clean:
-	rm crab
+	rm -f utf8.so crab.so
